@@ -1,13 +1,8 @@
 import "dotenv/config";
 import { Wallet, State, Signers, Envelope } from "@0xsequence/wallet-core";
-import {
-  Config,
-  Context,
-  Payload,
-  Address as SequenceAddress,
-} from "@0xsequence/wallet-primitives";
+import { Config, Context, Payload } from "@0xsequence/wallet-primitives";
 import { Relayer } from "@0xsequence/relayer";
-import { Address, Hex, RpcTransport, Provider } from "ox";
+import { Address, RpcTransport, Provider } from "ox";
 
 // Helper to ensure env vars are present
 const requireEnv = (name: string): string => {
@@ -29,23 +24,37 @@ async function main() {
   const relayerUrl = requireEnv("RELAYER_URL");
   const explorerUrl = requireEnv("EXPLORER_URL");
 
-  // Append access key to node URL for authentication
   const nodeUrl = baseNodeUrl.endsWith("/")
     ? `${baseNodeUrl}${projectAccessKey}`
     : `${baseNodeUrl}/${projectAccessKey}`;
 
-  console.log("--- Sequence V3 Transaction Example ---");
+  console.log("--- Sequence V3 Backend Transaction Example ---");
   console.log(`Chain ID: ${chainId}`);
 
   // -------------------------------------------------------------------------
-  // 2. Wallet Setup (Topology)
+  // 2. Setup Signer & Services
   // -------------------------------------------------------------------------
-
-  // Initialize the EOA (External Owned Account) signer
   const signer = new Signers.Pk.Pk(privateKey);
   console.log(`Signer Address (EOA): ${signer.address}`);
 
-  // Define the Single-Signer Topology (Weight 1 / Threshold 1)
+  // Services
+  const stateProvider = new State.Sequence.Provider(
+    "https://keymachine.sequence.app"
+  );
+  const baseProvider = Provider.from(RpcTransport.fromHttp(nodeUrl));
+  const provider = baseProvider as any; // Cast to bypass strict type check
+  const relayer = new Relayer.RpcRelayer(
+    relayerUrl,
+    chainId,
+    nodeUrl,
+    fetch,
+    projectAccessKey
+  );
+
+  // -------------------------------------------------------------------------
+  // 3. Initialize Wallet
+  // -------------------------------------------------------------------------
+
   const topology: Config.Topology = {
     type: "signer",
     address: signer.address,
@@ -58,62 +67,26 @@ async function main() {
     topology: topology,
   };
 
-  // Calculate the Counterfactual Address (Address exists before deployment)
-  const context = Context.Rc4; // Use Release Candidate 4 (Standard V3 context)
-  const walletAddress = SequenceAddress.from(walletConfig, context);
-  console.log(`Smart Wallet Address: ${walletAddress}`);
-  console.log(`Target Address:       ${targetAddress}`);
+  // Wallet.fromConfiguration handles:
+  // 1. Calculating the address
+  // 2. Publishing the config (using stateProvider from options)
+  // 3. Creating the Wallet instance
+  const wallet = await Wallet.fromConfiguration(walletConfig, {
+    context: Context.Rc4,
+    stateProvider,
+  });
+
+  console.log(`Smart Wallet Address: ${wallet.address}`);
+  console.log("Wallet configuration synced.");
 
   // -------------------------------------------------------------------------
-  // 3. Initialize Services
-  // -------------------------------------------------------------------------
-
-  // StateProvider: Communicates with Sequence directory/indexer
-  const stateProvider = new State.Sequence.Provider(
-    "https://keymachine.sequence.app"
-  );
-
-  // Provider: Standard JSON-RPC connection
-  const baseProvider = Provider.from(RpcTransport.fromHttp(nodeUrl));
-  // Note: Casting to 'any' bypasses strict type checks between 'ox' versions
-  // but functionality is compatible for the wallet SDK.
-  const provider = baseProvider as any;
-
-  // Relayer: Dispatches transactions.
-  // IMPORTANT: 'fetch' must be passed explicitly in Node.js environments.
-  const relayer = new Relayer.RpcRelayer(
-    relayerUrl,
-    chainId,
-    nodeUrl,
-    fetch,
-    projectAccessKey
-  );
-
-  const wallet = new Wallet(walletAddress, { stateProvider });
-
-  // -------------------------------------------------------------------------
-  // 4. Publish Configuration
-  // -------------------------------------------------------------------------
-  // This ensures the Sequence Indexer knows this address belongs to this configuration.
-  try {
-    await stateProvider.saveWallet(walletConfig, context);
-    console.log("Wallet configuration published to directory.");
-  } catch (e) {
-    // Ignored safely: frequent occurrence if config is already published
-    console.warn(
-      "Note: Could not publish config (might already exist). Continuing..."
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // 5. Construct Transaction
+  // 4. Construct & Send Transaction
   // -------------------------------------------------------------------------
   const tx: Payload.Call = {
     to: targetAddress,
-    value: 0n, // 0 ETH
+    value: 0n,
     data: "0x",
-    // Gas Limit 0 tells the Relayer to estimate it automatically
-    gasLimit: 0n,
+    gasLimit: 0n, // Let Relayer estimate
     delegateCall: false,
     onlyFallback: false,
     behaviorOnError: "revert",
@@ -121,17 +94,13 @@ async function main() {
 
   console.log("Preparing transaction...");
 
-  // -------------------------------------------------------------------------
-  // 6. Sign & Relay
-  // -------------------------------------------------------------------------
-
-  // Prepare: Fetches nonce and creates the "Envelope"
+  // Prepare & Sign
   const envelope = await wallet.prepareTransaction(provider, [tx]);
-
-  // Sign: EOA signs the payload
-  const signature = await signer.sign(walletAddress, chainId, envelope.payload);
-
-  // Combine: Add signature to envelope
+  const signature = await signer.sign(
+    wallet.address,
+    chainId,
+    envelope.payload
+  );
   const signedEnvelope = Envelope.toSigned(envelope, [
     {
       address: signer.address,
@@ -141,15 +110,14 @@ async function main() {
 
   console.log("Relaying transaction...");
 
-  // Encode: Convert to EVM calldata
+  // Build & Relay
   const { to, data } = await wallet.buildTransaction(provider, signedEnvelope);
-
-  // Send: Dispatch to Relayer
   const { opHash } = await relayer.relay(to, data, chainId);
+
   console.log(`Transaction Sent! OpHash: ${opHash}`);
 
   // -------------------------------------------------------------------------
-  // 7. Wait for Confirmation
+  // 5. Wait for Confirmation
   // -------------------------------------------------------------------------
   console.log("Waiting for confirmation...");
   const wait = (ms: number) => new Promise((res) => setTimeout(res, ms));
